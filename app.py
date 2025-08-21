@@ -1,5 +1,6 @@
 import streamlit as st
 import pandas as pd
+import re
 from datetime import date, timedelta, datetime, time
 from typing import List, Dict, Tuple
 
@@ -25,7 +26,7 @@ def default_rooms() -> pd.DataFrame:
     rows = []
     for loc, rooms in DEFAULT_LOCATIONS:
         for s in rooms:
-            rows.append({"Lieu": loc, "Salle": s})  # capacité supprimée
+            rows.append({"Lieu": loc, "Salle": s})  # capacité par défaut 35
     return pd.DataFrame(rows)
 
 @st.cache_data(show_spinner=False)
@@ -46,7 +47,6 @@ def default_data():
         {"Classe": "PASS-B2", "Matière": "Physique",            "Heures": 2, "Prof": "Dr Chen"},
         {"Classe": "LAS-P7",  "Matière": "Chimie",              "Heures": 4, "Prof": "Dr Silva"},
     ])
-    # Indisponibilités sous forme de LISTE par défaut, mais l'UI accepte aussi une chaîne "Lundi;Jeudi"
     profs = pd.DataFrame([
         {"Prof": "Dr Martin", "Indisponibilités": ["Jeudi"]},
         {"Prof": "Dr Silva",  "Indisponibilités": []},
@@ -58,18 +58,6 @@ def default_data():
 
 def to_datetime(d: date, t: time) -> datetime:
     return datetime.combine(d, t)
-
-ALLOWED_DAYS = {"Lundi","Mardi","Mercredi","Jeudi","Vendredi","Dimanche"}
-
-def parse_days(value) -> List[str]:
-    """Accepte une liste (déjà propre) OU une chaîne "Lundi;Jeudi" / "lundi, jeudi"."""
-    if isinstance(value, list):
-        return [d for d in value if d in ALLOWED_DAYS]
-    if isinstance(value, str):
-        sep = ";" if ";" in value else ","
-        parts = [p.strip().capitalize() for p in value.split(sep) if p.strip()]
-        return [p for p in parts if p in ALLOWED_DAYS]
-    return []
 
 # ============================================================
 #   BARRE LATÉRALE : PARAMÈTRES
@@ -103,7 +91,7 @@ rooms_df = st.data_editor(
     num_rows="dynamic",
     column_config={
         "Lieu": st.column_config.SelectboxColumn(options=["Quai de la Rapée", "Ledru-Rollin"], width="medium"),
-        "Salle": st.column_config.TextColumn(width="small"),
+        "Salle": st.column_config.TextColumn(width="small")
     },
 )
 
@@ -134,24 +122,37 @@ curriculum_df = st.data_editor(
     column_config={
         "Classe": st.column_config.SelectboxColumn(options=sorted(classes_df["Classe"].unique()), width="medium"),
         "Matière": st.column_config.SelectboxColumn(options=sorted(matieres_df["Matière"].unique()), width="medium"),
-        "Heures": st.column_config.NumberColumn(min_value=2, max_value=20, step=2, help="Toujours par blocs de 2h (2, 4, 6, ...)")
-            ,
+        "Heures": st.column_config.NumberColumn(min_value=2, max_value=20, step=2, help="Toujours par blocs de 2h (2, 4, 6, ...)"),
         "Prof": st.column_config.TextColumn(help="Nom du professeur pour cette matière dans cette classe"),
     }
 )
 
-st.markdown("**Professeurs – Indisponibilités** (saisir les jours séparés par `;` ou `,`)
-
-Ex.: `Jeudi;Dimanche` ou `lundi, vendredi`.")
-profs_df = st.data_editor(
-    profs_df,
+# --- Professeurs : remplacer MultiselectColumn par champ texte (compatible Streamlit 1.33)
+# UI: on affiche et édite "Indisponibilités" comme texte "Jour1, Jour2" puis on reconvertit en liste
+st.markdown("**Professeurs – Indisponibilités** (écrire: `Jeudi, Dimanche`) :")
+profs_ui = profs_df.copy()
+profs_ui["Indisponibilités"] = profs_ui["Indisponibilités"].apply(
+    lambda v: ", ".join(v) if isinstance(v, list) else (v if isinstance(v, str) else "")
+)
+profs_ui = st.data_editor(
+    profs_ui,
     use_container_width=True,
     num_rows="dynamic",
     column_config={
-        # Remplace l'ancienne MultiselectColumn (non dispo sur certaines versions) par un champ texte libre
-        "Indisponibilités": st.column_config.TextColumn(help="Jours séparés par `;` ou `,`"),
+        "Indisponibilités": st.column_config.TextColumn(help="Exemples: 'Jeudi' ou 'Mardi, Dimanche'")
     }
 )
+
+ALLOWED_DAYS = {"Lundi","Mardi","Mercredi","Jeudi","Vendredi","Dimanche"}
+
+def parse_days(val: str) -> List[str]:
+    if not isinstance(val, str):
+        return []
+    parts = [p.strip().capitalize() for p in re.split(r"[,;]", val) if p.strip()]
+    return [p for p in parts if p in ALLOWED_DAYS]
+
+profs_df_processed = profs_ui.copy()
+profs_df_processed["Indisponibilités"] = profs_df_processed["Indisponibilités"].apply(parse_days)
 
 # ============================================================
 #   GÉNÉRATION DES CRÉNEAUX (9h→18h)
@@ -193,9 +194,10 @@ class Scheduler:
         self.curriculum = curriculum_df[curriculum_df["Heures"] > 0].copy()
 
         # Préparer map indispos
-        self.prof_indispo = {}
-        for _, row in self.profs.iterrows():
-            self.prof_indispo[row["Prof"]] = set(parse_days(row.get("Indisponibilités", [])))
+        self.prof_indispo = {
+            row["Prof"]: set(row.get("Indisponibilités", []) or [])
+            for _, row in self.profs.iterrows()
+        }
 
         # Jours actifs
         self.days = ["Lundi","Mardi","Mercredi","Jeudi","Vendredi"]
@@ -237,7 +239,7 @@ class Scheduler:
         return int(round(hours*60/slot_minutes))
 
     def pick_day_for_class(self, classe: str, prof: str) -> List[str]:
-        # Ordonner pour tendre vers 4–6h/jour
+        # Ordonner pour tendre vers 4–6h/jour / éviter 1h et 9h
         indispo = self.prof_indispo.get(prof, set())
         candidates = [d for d in self.days if d not in indispo and len(self.day_slots[d])>0]
         def score(d):
@@ -300,15 +302,15 @@ class Scheduler:
 
         for task in tasks:
             classe, matiere, prof, h_total = task["Classe"], task["Matière"], task["Prof"], int(task["Heures"])
-            n_blocks = h_total // 2  # entier via validation ci-dessus
+            n_blocks = h_total // 2  # garanti entier via validation ci-dessus
 
             for _ in range(n_blocks):
                 days_pref = self.pick_day_for_class(classe, prof)
                 placed = False
                 for day in days_pref:
-                    room, start_idx = self.find_consecutive_room_window(day, self.block2, classe, prof)
+                    room, start_idx = self.find_consecutive_room_window(day, self.slots_needed(2.0), classe, prof)
                     if room is not None:
-                        self.assign_block(classe, matiere, prof, day, room, start_idx, self.block2)
+                        self.assign_block(classe, matiere, prof, day, room, start_idx, self.slots_needed(2.0))
                         placed = True
                         break
                 if not placed:
@@ -322,7 +324,7 @@ class Scheduler:
 
 if st.button("🚀 Générer l'EDT"):
     try:
-        sched = Scheduler(semaine_lundi, rooms_df, profs_df, curriculum_df)
+        sched = Scheduler(semaine_lundi, rooms_df, profs_df_processed, curriculum_df)
         result_df = sched.schedule()
     except Exception as e:
         st.error(str(e))
@@ -381,9 +383,6 @@ xlsxwriter>=3.2
 ```
 
 **Locaux par défaut** : *Quai de la Rapée* et *Ledru-Rollin* (**4 salles chacun**).\
-**Samedi exclu**. **Dimanche** optionnel.\
-**Horaires imposés** : **09:00 → 18:00** tous les jours actifs.\
-**Blocs** : **toujours 2h** (les colonnes "Heures" doivent être multiples de 2).\
-**Capacité** : supprimée (1 classe = 1 salle).
+**Indisponibilités profs** : champ texte "Jeudi" ou "Mardi, Dimanche" (robuste avec Streamlit 1.33).
     """
 )

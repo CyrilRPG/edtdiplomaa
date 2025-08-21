@@ -25,7 +25,7 @@ def default_rooms() -> pd.DataFrame:
     rows = []
     for loc, rooms in DEFAULT_LOCATIONS:
         for s in rooms:
-            rows.append({"Lieu": loc, "Salle": s, "Capacité": 50})
+            rows.append({"Lieu": loc, "Salle": s})  # capacité supprimée
     return pd.DataFrame(rows)
 
 @st.cache_data(show_spinner=False)
@@ -46,6 +46,7 @@ def default_data():
         {"Classe": "PASS-B2", "Matière": "Physique",            "Heures": 2, "Prof": "Dr Chen"},
         {"Classe": "LAS-P7",  "Matière": "Chimie",              "Heures": 4, "Prof": "Dr Silva"},
     ])
+    # Indisponibilités sous forme de LISTE par défaut, mais l'UI accepte aussi une chaîne "Lundi;Jeudi"
     profs = pd.DataFrame([
         {"Prof": "Dr Martin", "Indisponibilités": ["Jeudi"]},
         {"Prof": "Dr Silva",  "Indisponibilités": []},
@@ -57,6 +58,18 @@ def default_data():
 
 def to_datetime(d: date, t: time) -> datetime:
     return datetime.combine(d, t)
+
+ALLOWED_DAYS = {"Lundi","Mardi","Mercredi","Jeudi","Vendredi","Dimanche"}
+
+def parse_days(value) -> List[str]:
+    """Accepte une liste (déjà propre) OU une chaîne "Lundi;Jeudi" / "lundi, jeudi"."""
+    if isinstance(value, list):
+        return [d for d in value if d in ALLOWED_DAYS]
+    if isinstance(value, str):
+        sep = ";" if ";" in value else ","
+        parts = [p.strip().capitalize() for p in value.split(sep) if p.strip()]
+        return [p for p in parts if p in ALLOWED_DAYS]
+    return []
 
 # ============================================================
 #   BARRE LATÉRALE : PARAMÈTRES
@@ -91,9 +104,7 @@ rooms_df = st.data_editor(
     column_config={
         "Lieu": st.column_config.SelectboxColumn(options=["Quai de la Rapée", "Ledru-Rollin"], width="medium"),
         "Salle": st.column_config.TextColumn(width="small"),
-        "Capacité": st.column_config.NumberColumn(min_value=1, step=1, width="small"),
     },
-    disabled=["Capacité"],
 )
 
 st.subheader("📚 Données pédagogiques")
@@ -129,13 +140,16 @@ curriculum_df = st.data_editor(
     }
 )
 
-st.markdown("**Professeurs – Indisponibilités** (multi-sélection de jours)")
+st.markdown("**Professeurs – Indisponibilités** (saisir les jours séparés par `;` ou `,`)
+
+Ex.: `Jeudi;Dimanche` ou `lundi, vendredi`.")
 profs_df = st.data_editor(
     profs_df,
     use_container_width=True,
     num_rows="dynamic",
     column_config={
-        "Indisponibilités": st.column_config.MultiselectColumn(options=["Lundi","Mardi","Mercredi","Jeudi","Vendredi","Dimanche"], width="large")
+        # Remplace l'ancienne MultiselectColumn (non dispo sur certaines versions) par un champ texte libre
+        "Indisponibilités": st.column_config.TextColumn(help="Jours séparés par `;` ou `,`"),
     }
 )
 
@@ -179,10 +193,9 @@ class Scheduler:
         self.curriculum = curriculum_df[curriculum_df["Heures"] > 0].copy()
 
         # Préparer map indispos
-        self.prof_indispo = {
-            row["Prof"]: set(row.get("Indisponibilités", []) or [])
-            for _, row in self.profs.iterrows()
-        }
+        self.prof_indispo = {}
+        for _, row in self.profs.iterrows():
+            self.prof_indispo[row["Prof"]] = set(parse_days(row.get("Indisponibilités", [])))
 
         # Jours actifs
         self.days = ["Lundi","Mardi","Mercredi","Jeudi","Vendredi"]
@@ -224,7 +237,7 @@ class Scheduler:
         return int(round(hours*60/slot_minutes))
 
     def pick_day_for_class(self, classe: str, prof: str) -> List[str]:
-        # Ordonner pour tendre vers 4–6h/jour / éviter 1h et 9h
+        # Ordonner pour tendre vers 4–6h/jour
         indispo = self.prof_indispo.get(prof, set())
         candidates = [d for d in self.days if d not in indispo and len(self.day_slots[d])>0]
         def score(d):
@@ -287,7 +300,7 @@ class Scheduler:
 
         for task in tasks:
             classe, matiere, prof, h_total = task["Classe"], task["Matière"], task["Prof"], int(task["Heures"])
-            n_blocks = h_total // 2  # garanti entier via validation ci-dessus
+            n_blocks = h_total // 2  # entier via validation ci-dessus
 
             for _ in range(n_blocks):
                 days_pref = self.pick_day_for_class(classe, prof)
@@ -370,8 +383,7 @@ xlsxwriter>=3.2
 **Locaux par défaut** : *Quai de la Rapée* et *Ledru-Rollin* (**4 salles chacun**).\
 **Samedi exclu**. **Dimanche** optionnel.\
 **Horaires imposés** : **09:00 → 18:00** tous les jours actifs.\
-**Blocs** : **toujours 2h** (les colonnes "Heures" doivent être multiples de 2).
-
-Si vous souhaitez verrouiller la granularité à 60 min ou forcer le dimanche activé/désactivé par défaut, je peux l'ajuster.
+**Blocs** : **toujours 2h** (les colonnes "Heures" doivent être multiples de 2).\
+**Capacité** : supprimée (1 classe = 1 salle).
     """
 )
